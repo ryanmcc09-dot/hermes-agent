@@ -1558,14 +1558,57 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
             _ctx = contextvars.copy_context()
             _results.append(_ctx.run(_process_job, job))
 
-        # Parallel pass for the rest — same behaviour as before.
+        # Parallel pass for the rest. Do NOT use ThreadPoolExecutor as a
+        # context manager here: if one cron future wedges, ``as_completed`` can
+        # raise TimeoutError and the context manager's implicit
+        # ``shutdown(wait=True)`` will then wait forever, wedging the gateway's
+        # cron ticker and causing every later scheduled job to miss its window.
         if parallel_jobs:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers) as _tick_pool:
-                _futures = []
+            _parallel_timeout = 600
+            _tick_pool = concurrent.futures.ThreadPoolExecutor(max_workers=_max_workers)
+            _future_to_job: dict[concurrent.futures.Future, dict] = {}
+            _completed_futures: set[concurrent.futures.Future] = set()
+            try:
                 for job in parallel_jobs:
                     _ctx = contextvars.copy_context()
-                    _futures.append(_tick_pool.submit(_ctx.run, _process_job, job))
-                _results.extend(f.result() for f in _futures)
+                    _future = _tick_pool.submit(_ctx.run, _process_job, job)
+                    _future_to_job[_future] = job
+
+                try:
+                    for f in concurrent.futures.as_completed(_future_to_job, timeout=_parallel_timeout):
+                        _completed_futures.add(f)
+                        try:
+                            _results.append(f.result())
+                        except Exception as exc:
+                            logger.error("Parallel cron job future failed: %s", exc)
+                            _results.append(False)
+                except concurrent.futures.TimeoutError:
+                    unfinished = [
+                        (future, job)
+                        for future, job in _future_to_job.items()
+                        if future not in _completed_futures
+                    ]
+                    logger.error(
+                        "Parallel cron tick timed out after %ss with %d/%d job(s) unfinished; "
+                        "recovering ticker without waiting for hung futures",
+                        _parallel_timeout,
+                        len(unfinished),
+                        len(_future_to_job),
+                    )
+                    for future, job in unfinished:
+                        try:
+                            future.cancel()
+                        except Exception:
+                            pass
+                        error = (
+                            f"Cron parallel execution timed out after {_parallel_timeout}s; "
+                            "the gateway ticker recovered without waiting for this hung job."
+                        )
+                        logger.error("Marking cron job %s as timed out", job.get("id"))
+                        mark_job_run(job["id"], False, error)
+                        _results.append(False)
+            finally:
+                _tick_pool.shutdown(wait=False, cancel_futures=True)
 
         # Best-effort sweep of MCP stdio subprocesses that survived their
         # session teardown during this tick.  Runs AFTER every job has

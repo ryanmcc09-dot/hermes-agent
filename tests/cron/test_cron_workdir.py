@@ -243,6 +243,81 @@ class TestTickWorkdirPartition:
         workdir_thread_name = next(t for jid, t in calls if jid == "a")
         assert workdir_thread_name == main_thread_name
 
+    def test_parallel_timeout_does_not_block_ticker(self, monkeypatch):
+        """A hung parallel cron job must not wedge the ticker indefinitely.
+
+        Regression coverage for a production incident where one local-model
+        cron future stopped returning. ``as_completed(..., timeout=600)`` raised
+        TimeoutError, then the ThreadPoolExecutor context manager waited for the
+        hung future forever, so the cron ticker never reached the next tick.
+        """
+        import concurrent.futures
+        import cron.scheduler as sched
+
+        done_job = {"id": "done", "name": "Done"}
+        hung_job = {"id": "hung", "name": "Hung"}
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [done_job, hung_job])
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "run_job", lambda _job: (_ for _ in ()).throw(AssertionError("submit should be stubbed")))
+        monkeypatch.setattr(sched, "save_job_output", lambda _jid, _o: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        marked: list[tuple[str, bool, str | None]] = []
+        monkeypatch.setattr(
+            sched,
+            "mark_job_run",
+            lambda jid, success, error=None, **_kw: marked.append((jid, success, error)),
+        )
+
+        class FakeFuture:
+            def __init__(self, job_id: str):
+                self.job_id = job_id
+                self.cancelled = False
+
+            def result(self):
+                return True
+
+            def cancel(self):
+                self.cancelled = True
+                return True
+
+        class FakePool:
+            shutdown_calls: list[tuple[bool, bool]] = []
+
+            def __init__(self, max_workers=None):
+                self.max_workers = max_workers
+                self.futures: list[FakeFuture] = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                raise AssertionError("ThreadPoolExecutor context manager would wait for hung cron futures")
+
+            def submit(self, _fn, _process_job, job):
+                fut = FakeFuture(job["id"])
+                self.futures.append(fut)
+                return fut
+
+            def shutdown(self, wait=True, cancel_futures=False):
+                FakePool.shutdown_calls.append((wait, cancel_futures))
+
+        def fake_as_completed(futures, timeout=None):
+            assert timeout == 600
+            futures = list(futures)
+            yield futures[0]
+            raise concurrent.futures.TimeoutError("simulated hung cron future")
+
+        monkeypatch.setattr(sched.concurrent.futures, "ThreadPoolExecutor", FakePool)
+        monkeypatch.setattr(sched.concurrent.futures, "as_completed", fake_as_completed)
+
+        assert sched.tick(verbose=False) == 1
+        assert any(
+            jid == "hung" and success is False and error and "timed out" in error.lower()
+            for jid, success, error in marked
+        )
+        assert FakePool.shutdown_calls == [(False, True)]
+
 
 # ---------------------------------------------------------------------------
 # scheduler.run_job: TERMINAL_CWD + skip_context_files wiring
