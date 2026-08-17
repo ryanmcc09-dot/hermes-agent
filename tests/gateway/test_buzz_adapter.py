@@ -68,10 +68,14 @@ def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind
     }
 
 
-def _make_adapter(extra=None):
+def _make_adapter(extra=None, reply_to_mode="first"):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    cfg = PlatformConfig(
+        enabled=True,
+        reply_to_mode=reply_to_mode,
+        extra={"relay_url": "https://test.relay", **(extra or {})},
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB
@@ -407,6 +411,37 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_threads_by_default(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "threaded", reply_to="parent-event")
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "parent-event"
+
+    @pytest.mark.asyncio
+    async def test_send_reply_to_mode_off_stays_flat(self):
+        adapter = _make_adapter(reply_to_mode="off")
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt125", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "flat",
+            reply_to="parent-event",
+            metadata={"thread_id": "metadata-thread"},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
@@ -420,6 +455,50 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_send_image_reply_to_mode_off_stays_flat(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter(reply_to_mode="off")
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt127", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="flat screenshot",
+            reply_to="parent-event",
+            metadata={"thread_id": "metadata-thread"},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("reply_to_mode", ["first", "all"])
+    async def test_send_image_metadata_only_preserves_flat_behavior(
+        self, tmp_path, reply_to_mode
+    ):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter(reply_to_mode=reply_to_mode)
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt128", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="metadata only",
+            metadata={"thread_id": "metadata-thread"},
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--reply-to" not in args
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────

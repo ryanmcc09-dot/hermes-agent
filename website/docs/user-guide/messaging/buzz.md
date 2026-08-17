@@ -95,6 +95,25 @@ gateway:
 
 **Exception:** If you want users to see tool progress (e.g., for long-running operations), set `tool_progress: all` — but `interim_assistant_messages` should still be `false` to avoid spamming with every tool result.
 
+## Flat replies instead of branches
+
+Buzz threads replies by default (`reply_to_mode: first`). To keep an agent's
+responses in the main channel or DM timeline instead of creating a branch for
+each response, set the platform reply mode to `off`:
+
+```yaml
+gateway:
+  platforms:
+    buzz:
+      enabled: true
+      reply_to_mode: "off"
+      extra:
+        relay_url: https://mycommunity.communities.buzz.xyz
+```
+
+For Buzz's current single-send behavior, `first` and `all` both preserve
+threaded replies.
+
 ## Mentions, channels, and DMs
 
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.

@@ -375,6 +375,12 @@ class BuzzAdapter(BasePlatformAdapter):
 
         self.home_channel = (os.getenv("BUZZ_HOME_CHANNEL") or str(extra.get("home_channel", "") or "")).strip()
 
+        # Keep Buzz aligned with the shared PlatformConfig reply contract.
+        # ``off`` posts flat channel/DM messages; ``first`` and ``all`` retain
+        # the existing reply-thread behavior (Buzz sends one chunk per call).
+        _reply_mode = str(getattr(config, "reply_to_mode", "first") or "first").strip().lower()
+        self._reply_to_mode = _reply_mode if _reply_mode in {"off", "first", "all"} else "first"
+
         try:
             interval = float(os.getenv("BUZZ_POLL_INTERVAL") or extra.get("poll_interval", _DEFAULT_POLL_INTERVAL))
         except (TypeError, ValueError):
@@ -599,6 +605,16 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    def _reply_target(
+        self,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Resolve a Buzz reply anchor while honoring ``reply_to_mode``."""
+        if self._reply_to_mode == "off":
+            return None
+        return reply_to or (metadata or {}).get("thread_id")
+
     async def send(
         self,
         chat_id: str,
@@ -609,7 +625,7 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        reply_target = self._reply_target(reply_to, metadata)
         if reply_target:
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=content)
@@ -681,8 +697,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--file", str(local),
                 "--content", "-",
             ]
-            if reply_to:
-                args += ["--reply-to", str(reply_to)]
+            # Preserve the historical local-image contract: only an explicit
+            # reply_to anchors the upload. Metadata-only thread ids have never
+            # threaded this path. ``off`` suppresses even that explicit anchor.
+            reply_target = None if self._reply_to_mode == "off" else reply_to
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)

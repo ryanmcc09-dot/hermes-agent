@@ -643,7 +643,7 @@ class PlatformConfig:
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
 
-    # Reply threading mode (Telegram/Slack)
+    # Reply threading mode (platforms that support reply anchors)
     # - "off": Never thread replies to original message
     # - "first": Only first chunk threads to user's message (default)
     # - "all": All chunks in multi-part replies thread to user's message
