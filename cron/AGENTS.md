@@ -15,7 +15,9 @@ A's last output into job B's prompt), `workdir` (run with that directory's `AGEN
 loaded), multi-platform delivery.
 
 Hardening invariants — each guards a real failure; don't weaken without answering for it:
-- **3-minute hard interrupt** on cron sessions: runaway loops cannot monopolise the scheduler.
+- **Configurable hard wall-clock interrupt** on agent-backed cron sessions: set
+  `cron.max_wall_seconds` to prevent active tool/model loops from monopolising the scheduler;
+  `None`/`0` preserves unlimited legacy behavior.
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that

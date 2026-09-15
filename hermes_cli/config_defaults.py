@@ -1691,6 +1691,9 @@ DEFAULT_CONFIG = {
         # Max due jobs run in parallel per tick. None/0 = unbounded (thread count only); 1 = serial.
         # Env override: HERMES_CRON_MAX_PARALLEL.
         "max_parallel_jobs": None,
+        # Hard wall-clock cap for each agent-backed cron run. None/0 = unlimited. Unlike the
+        # inactivity watchdog, active tool/model heartbeats do not extend this budget.
+        "max_wall_seconds": None,
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,

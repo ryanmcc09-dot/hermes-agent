@@ -37,6 +37,16 @@ def test_inactivity_timeout_is_not_reported_as_provider_timeout():
     assert "Daily Repo Sweep" in msg
 
 
+def test_wall_clock_limit_is_not_reported_as_provider_timeout():
+    job = {"name": "Vault Monitor", "id": "e4fb58f695a5"}
+    error = "TimeoutError: Cron job 'Vault Monitor' exceeded wall-clock runtime limit (3600s)"
+    msg = _summarize_cron_failure_for_delivery(job, error)
+    assert "provider timeout" not in msg
+    assert "fallback chain" not in msg.lower()
+    assert "wall-clock" in msg.lower()
+    assert "Vault Monitor" in msg
+
+
 def test_genuine_provider_timeout_with_no_fallback_configured(monkeypatch):
     monkeypatch.setattr(scheduler, "load_config", lambda: {"fallback_providers": []})
     monkeypatch.setattr(scheduler, "get_fallback_chain", lambda cfg: [])

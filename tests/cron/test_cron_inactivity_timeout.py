@@ -15,6 +15,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 
 # Ensure project root is importable
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -78,6 +80,43 @@ class SlowFakeAgent(FakeAgent):
         self._start_time = time.time()
         time.sleep(self._run_duration)
         return {"final_response": "Completed after work", "messages": []}
+
+
+class ContinuouslyActiveAgent(FakeAgent):
+    """Agent that emits activity forever until the scheduler interrupts it."""
+
+    def run_conversation(self, prompt, task_id=None):
+        while not self._interrupted:
+            time.sleep(0.005)
+        return {"final_response": "", "messages": [], "failed": True}
+
+
+class DelayedSuccessAgent(FakeAgent):
+    def run_conversation(self, prompt, task_id=None):
+        time.sleep(0.06)
+        return {"final_response": "late success", "messages": []}
+
+
+class HardInterruptOnlyAgent(FakeAgent):
+    def __init__(self):
+        super().__init__(idle_seconds=0.0, activity_desc="api_call_streaming")
+        self.hard_interrupt_called = False
+        self.soft_interrupt_called = False
+        self.finished = threading.Event()
+
+    def interrupt(self, msg=None):
+        self.soft_interrupt_called = True
+
+    def hard_interrupt(self, message=None):
+        self.hard_interrupt_called = True
+        self._interrupt_msg = message
+        self._interrupted = True
+
+    def run_conversation(self, prompt, task_id=None):
+        while not self._interrupted:
+            time.sleep(0.005)
+        self.finished.set()
+        return {"final_response": "", "messages": [], "failed": True}
 
 
 class TestInactivityTimeout:
@@ -166,6 +205,57 @@ class TestInactivityTimeout:
         pool.shutdown(wait=False)
 
         assert result["final_response"] == "Done"
+
+    def test_continuously_active_agent_still_hits_wall_clock_limit(self, monkeypatch):
+        """Activity heartbeats must not let a cron worker occupy a provider forever."""
+        import cron.scheduler as scheduler
+
+        agent = ContinuouslyActiveAgent(idle_seconds=0.0, activity_desc="api_call_streaming")
+        monkeypatch.setattr(scheduler, "_CRON_WATCHDOG_POLL_SECONDS", 0.01)
+        monkeypatch.setattr(scheduler, "_cron_inactivity_seconds", lambda: 0.0)
+        monkeypatch.setattr(scheduler, "_cron_wall_seconds", lambda job: 0.05)
+
+        with pytest.raises(TimeoutError, match="wall-clock runtime limit"):
+            scheduler._run_agent_with_watchdog(
+                agent, "test", {"id": "wall-cap"}, "wall-cap", "Wall Cap", "task", None)
+
+        assert agent._interrupted is True
+        assert agent._interrupt_msg is not None
+        assert "wall-clock runtime limit" in agent._interrupt_msg
+
+    def test_success_completed_after_deadline_is_rejected(self, monkeypatch):
+        import cron.scheduler as scheduler
+
+        agent = DelayedSuccessAgent(idle_seconds=0.0)
+        monkeypatch.setattr(scheduler, "_CRON_WATCHDOG_POLL_SECONDS", 0.1)
+        monkeypatch.setattr(scheduler, "_cron_inactivity_seconds", lambda: 0.0)
+        monkeypatch.setattr(scheduler, "_cron_wall_seconds", lambda job: 0.05)
+
+        with pytest.raises(TimeoutError, match="wall-clock runtime limit"):
+            scheduler._run_agent_with_watchdog(
+                agent, "test", {"id": "late-success"}, "late-success", "Late Success", "task", None)
+
+    def test_wall_timeout_hard_interrupts_and_worker_exits(self, monkeypatch):
+        import cron.scheduler as scheduler
+
+        agent = HardInterruptOnlyAgent()
+        worker_state = {}
+        monkeypatch.setattr(scheduler, "_CRON_WATCHDOG_POLL_SECONDS", 1.0)
+        monkeypatch.setattr(scheduler, "_cron_inactivity_seconds", lambda: 0.0)
+        monkeypatch.setattr(scheduler, "_cron_wall_seconds", lambda job: 0.05)
+
+        started_at = time.monotonic()
+        with pytest.raises(TimeoutError, match="wall-clock runtime limit"):
+            scheduler._run_agent_with_watchdog(
+                agent, "test", {"id": "hard-cap"}, "hard-cap", "Hard Cap", "task", None,
+                worker_state=worker_state)
+        elapsed = time.monotonic() - started_at
+
+        assert agent.hard_interrupt_called is True
+        assert agent.soft_interrupt_called is False
+        assert elapsed < 0.25
+        assert agent.finished.wait(1.0)
+        assert worker_state["future"].done()
 
     def _parse_cron_timeout(self, raw_value):
         """Mirror the defensive parsing logic from cron/scheduler.py run_job()."""

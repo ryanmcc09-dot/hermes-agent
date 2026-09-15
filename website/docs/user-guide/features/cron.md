@@ -718,6 +718,18 @@ cron:
 
 Set `cleanup_timeout_seconds: 0` only to restore the legacy unbounded cleanup behavior.
 
+## Agent wall-clock timeout
+
+The normal agent watchdog is inactivity-based: tool calls and model activity reset it. To stop an active but runaway agent loop from occupying cron capacity indefinitely, set a hard wall-clock budget:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  max_wall_seconds: 3600   # one hour; None/0 keeps legacy unlimited behavior
+```
+
+When the budget expires, Hermes interrupts the agent and records a wall-clock-limit failure rather than misreporting a provider timeout. This does not change `cron.script_timeout_seconds`, which applies only to pre-run/no-agent scripts.
+
 ## Media send timeout
 
 When a cron delivery includes media attachments (a generated PDF, TTS audio, an exported report) sent through a live gateway adapter, each attachment upload is bounded by a timeout — 300 seconds by default. Large files on slow uplinks can need more:

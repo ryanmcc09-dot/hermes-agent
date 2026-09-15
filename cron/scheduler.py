@@ -252,6 +252,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
+    if "exceeded wall-clock runtime limit" in lower:
+        return (
+            f"⚠️ Cron '{job_name}' failed: the job exceeded its configured wall-clock "
+            "runtime cap and was interrupted. Full details saved in cron output.")
+
     # Scheduler inactivity watchdog shape ("idle for {n}s (limit {m}s)"). Must precede the generic
     # provider-timeout branch: the job's own tool going quiet involves no provider/fallback chain.
     # The scheduler's own inactivity watchdog (see the TimeoutError raised above at "Cron job '{job_name}'
@@ -947,6 +952,27 @@ def _cron_inactivity_seconds() -> float:
         return 600.0
 
 
+def _cron_wall_seconds(job: dict) -> Optional[float]:
+    """Return the hard wall-clock budget for an agent-backed cron run.
+
+    A positive per-job ``max_runtime_seconds`` wins; otherwise use
+    ``cron.max_wall_seconds``. Missing, zero, negative, or malformed values
+    preserve the historical unlimited behavior.
+    """
+    raw = job.get("max_runtime_seconds")
+    if raw is None:
+        with contextlib.suppress(Exception):
+            cfg = load_config() or {}
+            raw = (cfg.get("cron", {}) if isinstance(cfg, dict) else {}).get("max_wall_seconds")
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers
@@ -1107,6 +1133,7 @@ _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
 _RUN_CLAIM_HEARTBEAT_SECONDS = 60.0
 _FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS = _RUN_CLAIM_HEARTBEAT_SECONDS * 3
+_CRON_WATCHDOG_POLL_SECONDS = 5.0
 
 
 def _cron_cleanup_timeout_seconds() -> float:
@@ -1660,7 +1687,9 @@ def _run_agent_with_watchdog(
     watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-    _POLL_INTERVAL = 5.0
+    _POLL_INTERVAL = _CRON_WATCHDOG_POLL_SECONDS
+    _cron_wall_limit = _cron_wall_seconds(job)
+    _wall_deadline = time.monotonic() + _cron_wall_limit if _cron_wall_limit else None
     # Heartbeat the one-shot run_claim while alive: without it a long run looks like a dead owner
     # and gets re-dispatched / stale-removed out from under the live run.
     # Keep the one-shot run_claim fresh while the run is alive (#62002): the claim TTL is a dead-owner
@@ -1697,11 +1726,21 @@ def _run_agent_with_watchdog(
     _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     # Carry scheduler-scoped ContextVar state (e.g. env passthrough) into the worker thread.
     _cron_context = contextvars.copy_context()
-    _cron_future = _cron_pool.submit(
-        _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
+    # Record the worker's actual completion time. The watchdog polls, so the
+    # observation time of a completed Future cannot determine deadline order.
+    _completed_at: list[Optional[float]] = [None]
+
+    def _run_conversation():
+        try:
+            return agent.run_conversation(prompt, task_id=task_id)
+        finally:
+            _completed_at[0] = time.monotonic()
+
+    _cron_future = _cron_pool.submit(_cron_context.run, _run_conversation)
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
+    _wall_timeout = False
     _watch_stop = threading.Event()
 
     def _idle_seconds() -> float:
@@ -1731,17 +1770,44 @@ def _run_agent_with_watchdog(
             # loop / hung ``get_activity_summary`` on this thread can no longer keep the 600s inactivity
             # limit from firing (#94285).
             _watch_thread.start()
-        if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+        if (
+            _cron_inactivity_limit is None
+            and _cron_wall_limit is None
+            and not _is_oneshot
+            and cancel_event is None
+        ):
             result = _cron_future.result()
         else:
             result = None
             while True:
-                done, _ = concurrent.futures.wait({_cron_future}, timeout=_POLL_INTERVAL)
+                _wait_seconds = _POLL_INTERVAL
+                if _wall_deadline is not None:
+                    _wait_seconds = min(
+                        _wait_seconds,
+                        max(0.0, _wall_deadline - time.monotonic()),
+                    )
+                done, _ = concurrent.futures.wait({_cron_future}, timeout=_wait_seconds)
                 if done:
                     _abort_if_fire_claim_lost()
                     result = _cron_future.result()
+                    if (
+                        _wall_deadline is not None
+                        and _completed_at[0] is not None
+                        and _completed_at[0] >= _wall_deadline
+                    ):
+                        _wall_timeout = True
                     break
                 if _inactivity_timeout:
+                    break
+                if _wall_deadline is not None and time.monotonic() >= _wall_deadline:
+                    _wall_timeout = True
+                    assert _cron_wall_limit is not None
+                    request_hard_interrupt(
+                        agent,
+                        f"Cron job '{job_name}' exceeded wall-clock runtime limit "
+                        f"({int(_cron_wall_limit)}s)",
+                        tool_reason="cron_wall_timeout",
+                    )
                     break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
@@ -1754,6 +1820,11 @@ def _run_agent_with_watchdog(
 
     if _inactivity_timeout:
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
+    if _wall_timeout:
+        assert _cron_wall_limit is not None
+        raise TimeoutError(
+            f"Cron job '{job_name}' exceeded wall-clock runtime limit "
+            f"({int(_cron_wall_limit)}s)")
 
     if not isinstance(result, dict):
         raise RuntimeError(
