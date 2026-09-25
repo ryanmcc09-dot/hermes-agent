@@ -331,6 +331,14 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
     python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
     if env_overlay:
         return _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path)), env_overlay, None
+    # Managed POSIX gateways use a bare embedded interpreter. Sanitization
+    # correctly removes its package path, so activate the committed generation
+    # in the script child too, not merely in the external scheduler process.
+    from pm.environments import runtime_facts_path
+    root = Path(__file__).resolve().parents[1]
+    if sys.platform != "win32" and runtime_facts_path(root).is_file():
+        from cron.scheduler_worker_env import managed_script_command
+        return managed_script_command(python_exe, root, path), env_overlay, None
     return [python_exe, str(path)], env_overlay, None
 
 

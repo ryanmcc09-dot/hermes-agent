@@ -31,3 +31,42 @@ def test_committed_dependencies_activate_before_cron_package_import(tmp_path):
     assert new.returncode == 0, new.stderr
     assert json.loads(new.stdout) == ['--external-worker-file', str(payload), '--ack-file', str(ack)]
     assert 'VIRTUAL_ENV' not in env
+
+
+def test_script_child_activates_packages_and_preserves_script_contract(tmp_path, monkeypatch):
+    from cron import scheduler_script
+    from pm import environments
+    from cron.scheduler_worker_env import managed_script_command
+
+    root = tmp_path / 'managed checkout'
+    (root / 'pm').mkdir(parents=True)
+    (root / 'generation').mkdir()
+    (root / 'pm/__init__.py').write_text('')
+    (root / 'pm/environments.py').write_text(
+        'import sys\ndef activate_dependencies(root):\n'
+        '    sys.path.insert(0, str(root / "generation"))\n')
+    (root / 'generation/script_dependency.py').write_text('ready = True\n')
+    scripts = tmp_path / 'profile scripts'
+    scripts.mkdir()
+    (scripts / 'sibling.py').write_text('ready = True\n')
+    script = scripts / 'check.py'
+    script.write_text('import script_dependency,sibling,json,os,sys\n'
+                      'assert script_dependency.ready and sibling.ready\n'
+                      'print(json.dumps([sys.argv, __file__, os.getcwd(), os.getenv("PRIVATE_KEY")]))\n')
+    facts = tmp_path / 'facts.json'
+    facts.write_text('{}')
+    monkeypatch.setattr(environments, 'runtime_facts_path', lambda _: facts)
+    monkeypatch.setattr(scheduler_script, '__file__', str(root/'cron/scheduler_script.py'))
+    monkeypatch.setattr(scheduler_script.sys, 'platform', 'linux')
+    monkeypatch.setenv('PRIVATE_KEY', 'must-not-be-propagated')
+    command, overlay, error = scheduler_script._script_argv(script)
+    assert command == managed_script_command(sys.executable, root, script) and not overlay and not error
+    env = {'PATH': os.defpath, 'PYTHONSAFEPATH': '1'}
+    old = subprocess.run([sys.executable, str(script)], cwd=tmp_path, env=env,
+                         capture_output=True, text=True, timeout=15)
+    assert old.returncode != 0 and 'script_dependency' in old.stderr
+    result = subprocess.run(command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == [[str(script)], str(script), str(tmp_path), None]
+    facts.unlink()
+    assert scheduler_script._script_argv(script)[0] == [sys.executable, str(script)]

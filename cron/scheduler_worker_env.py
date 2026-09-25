@@ -37,6 +37,24 @@ def external_worker_command(python: str, repo_root: Path, payload: Path, ack: Pa
     return [python, "-c", bootstrap, "--external-worker-file", str(payload), "--ack-file", str(ack)]
 
 
+def managed_script_command(python: str, repo_root: Path, script: Path) -> list[str]:
+    """Restore committed dependencies in a sanitized Python script child.
+
+    No environment variables or secrets are copied from the gateway. Preserve
+    normal script argv, sibling imports, cwd and exit behavior after PM activation.
+    """
+    bootstrap = (
+        "import os, sys, runpy; from pathlib import Path; "
+        f"sys.path.insert(0, {str(repo_root.resolve())!r}); "
+        "from pm.environments import activate_dependencies; "
+        f"activate_dependencies(Path({str(repo_root.resolve())!r})); "
+        "script = sys.argv[1]; sys.argv = sys.argv[1:]; "
+        "sys.path.insert(0, os.path.dirname(os.path.abspath(script))); "
+        "runpy.run_path(script, run_name='__main__')"
+    )
+    return [python, "-c", bootstrap, str(script)]
+
+
 def _installed_purelib() -> Path | None:
     try:
         return Path(sysconfig.get_paths()["purelib"]).resolve()
